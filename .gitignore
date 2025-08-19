@@ -1,0 +1,16 @@
+__pycache__
+.DS_Store
+.venv
+data/
+exp/
+sandbox.ipynb
+speechmatics*.py
+sweep/
+default_old.yaml
+*.wav
+french/
+data_out/
+cv-corpus-22.0-delta-2025-06-20/
+gen.ipynb
+.env
+speechmatics.sh
