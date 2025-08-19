@@ -13,7 +13,7 @@ data_out/
 cv-corpus-22.0-delta-2025-06-20/
 cv-corpus-22.0-2025-06-20
 cv-corpus-22.0-de/
-cv-corpus-22.0-de_small/
+cv-corpus-22.0-de-small/
 gen.ipynb
 .env
 speechmatics.sh
