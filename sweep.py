@@ -49,6 +49,15 @@ def parse_args(arg_string=None):
     )
     parser.add_argument("--gen_speaker", type=int, default=999, help="Speaker id for model to generate")
 
+    # NEW: allow streaming from disk to avoid AttributeError in train.py
+    parser.add_argument(
+        "--partial-data-loading",
+        dest="partial_data_loading",
+        action="store_true",
+        help="Stream batches from disk instead of preloading HDF5 into RAM.",
+    )
+    parser.set_defaults(partial_data_loading=False)
+
     args = parser.parse_args(arg_string.split() if arg_string else None)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     return args
@@ -92,12 +101,15 @@ def worker(args, gpu_id, study_name, storage_name):
             elif param["type"] == "fixed":
                 config[name] = param["value"]
         
+        # ensure W&B dir exists and pass a string path
+        wandb_dir = args.output_dir / "wandb"
+        wandb_dir.mkdir(parents=True, exist_ok=True)
         wandb.init(
             project=args.wandb_project,
             name=f"trial-{trial.number}-gpu-{gpu_id}",
             config=config,
             group="optuna_sweep",
-            dir=args.output_dir / "wandb",
+            dir=str(wandb_dir),
             reinit=True,
         )
 
@@ -168,16 +180,26 @@ if __name__ == "__main__":
     for p in processes:
         p.join()
 
+    # NEW: avoid crash if all trials failed
+    completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    if not completed:
+        print("No completed trials; all trials failed. Check logs above.")
+        for t in study.trials:
+            print(f"Trial {t.number}: state={t.state}, params={t.params}")
+        raise SystemExit(1)
+
     with open(args.output_dir / "config.yaml", "w") as f:
         yaml.safe_dump(study.best_trial.params, f, default_flow_style=False)
     
     save_visualization(study)
     
     # log a summary of the sweep to wandb
+    wandb_dir = args.output_dir / "wandb"
+    wandb_dir.mkdir(parents=True, exist_ok=True)
     wandb.init(
         project=args.wandb_project,
         name="sweep-summary",
-        dir=args.output_dir / "wandb",
+        dir=str(wandb_dir),
     )
     wandb.config.update(study.best_trial.params)
     wandb.log({"best_val_loss": study.best_trial.value})
