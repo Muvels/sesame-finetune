@@ -44,7 +44,7 @@ def parse_args(arg_string=None):
     parser.add_argument(
         "--gen_sentence",
         type=str,
-        default="Bird law in this country is not governed by reason.",
+        default="Geduld ist oft der Schlüssel zu langfristigem Erfolg.",
         help="Sentence for model to generate during evaluation",
     )
     parser.add_argument("--gen_speaker", type=int, default=999, help="Speaker id for model to generate")
