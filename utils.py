@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Union
 from torch.optim.lr_scheduler import LambdaLR
 from torch import nn
+import contextlib
+
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 CSM_REPO_PATH = os.getenv("CSM_REPO_PATH")
@@ -222,21 +224,29 @@ def custom_generator_init(self, model: Model, audio_tokenizer: torch.nn.Module, 
     self._watermarker = watermarker
 
 
-def generate_audio(model, audio_tokenizer, text_tokenizer, watermarker, text, speaker_id, device, use_amp=True, max_audio_length_ms=10_000):
+def generate_audio(model, audio_tokenizer, text_tokenizer, watermarker, text, speaker_id, device,
+                   use_amp=True, max_audio_length_ms=10_000):
     """Generate audio from text."""
     model.eval()
+
+    # keep your custom generator init
     Generator.__init__ = types.MethodType(custom_generator_init, Generator)
     generator = Generator(model, audio_tokenizer, text_tokenizer, watermarker)
-    
-    with torch.no_grad(), torch.amp.autocast(device_type=str(device), enabled=use_amp):
+
+    # only use autocast on CUDA; disable on MPS/CPU to avoid "unsupported scalarType"
+    devtype = getattr(device, "type", str(device))
+    amp_enabled = bool(use_amp and devtype == "cuda")
+    amp_ctx = torch.amp.autocast(device_type="cuda") if amp_enabled else contextlib.nullcontext()
+
+    with torch.no_grad(), amp_ctx:
         audio = generator.generate(
             text=text,
             speaker=speaker_id,
             context=[],
             max_audio_length_ms=max_audio_length_ms,
         )
-        audio = audio.squeeze().cpu().numpy()
-    
+        audio = audio.squeeze().detach().cpu().numpy()
+
     reset_caches(model)
     return audio
 

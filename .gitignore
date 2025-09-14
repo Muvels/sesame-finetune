@@ -17,3 +17,6 @@ cv-corpus-22.0-de-small/
 gen.ipynb
 .env
 speechmatics.sh
+*.pt
+audio_in/
+out/
