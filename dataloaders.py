@@ -27,6 +27,7 @@ class TokenizedDataset(Dataset):
         self._in_memory = load_in_memory
         self._audio = None
         self._text = None
+        self._frame_loss_mask = None
 
         # Read length once (for __len__)
         with h5py.File(token_dataset_path, "r") as f:
@@ -34,6 +35,8 @@ class TokenizedDataset(Dataset):
             if self._in_memory:
                 self._audio = [torch.tensor(a, dtype=torch.long) for a in f[f"{split}/audio"][:]]
                 self._text = [torch.tensor(t, dtype=torch.long) for t in f[f"{split}/text"][:]]
+                if f.get(f"{split}/frame_loss_mask") is not None:
+                    self._frame_loss_mask = [torch.tensor(m, dtype=torch.long) for m in f[f"{split}/frame_loss_mask"][:]]
 
     def __len__(self):
         return self._length
@@ -42,14 +45,17 @@ class TokenizedDataset(Dataset):
         if self._in_memory:
             flat_audio = self._audio[idx]
             text = self._text[idx]
+            frame_loss_mask = self._frame_loss_mask[idx] if self._frame_loss_mask is not None else None
         else:
             if self._file is None:
                 self._file = h5py.File(self.token_dataset_path, "r")
             flat_audio = torch.tensor(self._file[f"{self.split}/audio"][idx], dtype=torch.long)
             text = torch.tensor(self._file[f"{self.split}/text"][idx], dtype=torch.long)
+            flm_ds = self._file.get(f"{self.split}/frame_loss_mask")
+            frame_loss_mask = torch.tensor(flm_ds[idx], dtype=torch.long) if flm_ds is not None else None
 
         audio = flat_audio.view(AUDIO_NUM_CODEBOOKS, -1)
-        return {"audio": audio, "text": text}
+        return {"audio": audio, "text": text, "frame_loss_mask": frame_loss_mask}
 
 
 def collate_fn(batch: List[dict]):
@@ -57,11 +63,12 @@ def collate_fn(batch: List[dict]):
     Collate function for tokenized audio and text.
     Merges variable-length audio/text into a single padded tensor.
     """
-    tokens, tokens_mask = [], []
+    tokens, tokens_mask, audio_loss_masks = [], [], []
 
     for item in batch:
         audio_tokens = item["audio"]  # [n_codebooks, audio_seq_len]
         text_tokens = item["text"]    # [text_seq_len]
+        frame_loss_mask = item.get("frame_loss_mask", None)  # [audio_seq_len] or None
 
         # Add EOS frame to audio
         eos_frame = torch.zeros(audio_tokens.size(0), 1)
@@ -80,13 +87,31 @@ def collate_fn(batch: List[dict]):
         text_frame_mask[:, -1] = True
 
         # Concatenate and collect
-        tokens.append(torch.cat([text_frame, audio_frame], dim=0))
-        tokens_mask.append(torch.cat([text_frame_mask, audio_frame_mask], dim=0))
+        seq_tokens = torch.cat([text_frame, audio_frame], dim=0)
+        seq_mask = torch.cat([text_frame_mask, audio_frame_mask], dim=0)
+
+        tokens.append(seq_tokens)
+        tokens_mask.append(seq_mask)
+
+        # Build per-sequence audio loss mask aligned to seq length
+        # text positions -> 0; audio positions -> provided frame mask; EOS frame -> 0
+        if frame_loss_mask is not None:
+            flm = frame_loss_mask.long().view(-1)
+            flm = torch.cat([flm, torch.zeros(1, dtype=torch.long)], dim=0)  # pad for EOS
+            seq_audio_loss_mask = torch.cat([torch.zeros(len(text_tokens), dtype=torch.long), flm], dim=0)
+        else:
+            # default: include all audio frames (except EOS) in loss
+            flm = torch.ones(audio_tokens.size(1) - 1, dtype=torch.long)
+            flm = torch.cat([flm, torch.zeros(1, dtype=torch.long)], dim=0)
+            seq_audio_loss_mask = torch.cat([torch.zeros(len(text_tokens), dtype=torch.long), flm], dim=0)
+
+        audio_loss_masks.append(seq_audio_loss_mask)
 
     tokens = pad_sequence(tokens, batch_first=True)
     tokens_mask = pad_sequence(tokens_mask, batch_first=True, padding_value=False)
+    audio_loss_masks = pad_sequence(audio_loss_masks, batch_first=True, padding_value=0)
 
-    return tokens, tokens_mask
+    return tokens, tokens_mask, audio_loss_masks
 
 
 class BucketSampler(Sampler):

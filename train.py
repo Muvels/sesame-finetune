@@ -10,6 +10,7 @@ import torch
 from torch.amp import GradScaler, autocast
 from torch.nn.utils import clip_grad_norm_
 import wandb
+import json
 
 from utils import (
     load_model, 
@@ -50,6 +51,11 @@ def parse_args(arg_string=None):
         help="Sentence(s) for model to generate. If a path is provided, the model will generate from the sentences in the file.",
     )
     parser.add_argument("--gen_speaker", type=int, default=999, help="Speaker id for model to generate")
+    parser.add_argument(
+        "--gen_refs",
+        type=str,
+        default=None,
+        help="Reference audio for zero-shot cloning during periodic generations. Either a path to a JSON list of refs with keys {path,text,start,end} or a comma-separated list of wav paths.")
 
     parser.add_argument("--use_amp", action="store_true", help="Use Automatic Mixed Precision")
     parser.add_argument("--n_epochs", type=int, default=50, help="Number of epochs to train. If not provided, the training will run indefinitely.")
@@ -103,6 +109,27 @@ def train(args: argparse.Namespace, config: dict, device: torch.device, trial: o
         "best_val_loss": float("inf"),
     }
     
+    # parse generation refs if provided
+    def _parse_gen_refs(gen_refs):
+        if gen_refs is None:
+            return None
+        p = Path(str(gen_refs))
+        if p.exists() and p.suffix == ".json":
+            with open(p, "r") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return data
+            return None
+        # otherwise treat as comma-separated list of paths
+        refs = []
+        for token in str(gen_refs).split(","):
+            token = token.strip()
+            if token:
+                refs.append({"path": token})
+        return refs if refs else None
+
+    gen_ref_context = _parse_gen_refs(args.gen_refs)
+
     # Training loop
     step = 0
     train_losses = []
@@ -110,11 +137,17 @@ def train(args: argparse.Namespace, config: dict, device: torch.device, trial: o
     model.train()
     
     for epoch in range(args.n_epochs):
-        for tokens, tokens_mask in trainloader:
+        for batch in trainloader:
+            if len(batch) == 3:
+                tokens, tokens_mask, audio_loss_mask = batch
+                audio_loss_mask = audio_loss_mask.to(device)
+            else:
+                tokens, tokens_mask = batch
+                audio_loss_mask = None
             tokens, tokens_mask = tokens.to(device), tokens_mask.to(device)
                 
             with autocast(device_type=str(device), enabled=args.use_amp):
-                loss = model(tokens, tokens_mask)
+                loss = model(tokens, tokens_mask, audio_loss_mask)
                 loss = loss / config["grad_acc_steps"]
             
             scaler.scale(loss).backward()
@@ -189,7 +222,8 @@ def train(args: argparse.Namespace, config: dict, device: torch.device, trial: o
                         sentence,
                         args.gen_speaker,
                         device,
-                        use_amp=args.use_amp
+                        use_amp=args.use_amp,
+                        ref_context=gen_ref_context
                     )
                     
                     wandb.log({f"audio_{i}": wandb.Audio(audio, sample_rate=MIMI_SAMPLE_RATE)}, step=step)

@@ -12,6 +12,8 @@ from typing import Union
 from torch.optim.lr_scheduler import LambdaLR
 from torch import nn
 import contextlib
+import torchaudio
+import json
 
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
@@ -69,7 +71,7 @@ def load_tokenizers(device: Union[str, torch.device]):
     return text_tokenizer, audio_tokenizer
 
 
-def forward(self, tokens: torch.Tensor, tokens_mask: torch.Tensor):
+def forward(self, tokens: torch.Tensor, tokens_mask: torch.Tensor, audio_loss_mask: torch.Tensor = None):
     """
     Forward pass for Sesame's CSM model.
     This will be added to the model with `model.forward = types.MethodType(forward, model)`
@@ -104,13 +106,20 @@ def forward(self, tokens: torch.Tensor, tokens_mask: torch.Tensor):
     h = self.backbone(h, input_pos=input_pos, mask=backbone_attn_mask).to(dtype=dtype)
 
     # get backbone embeddings used for audio codebook prediction
-    audio_mask = torch.roll(audio_mask, -1, 1)  # shift audio mask to the right by 1
-    audio_h = h[audio_mask]  # [audio_len, embed_dim]
+    audio_mask_rolled = torch.roll(audio_mask, -1, 1)  # shift audio mask to the right by 1
+    audio_h = h[audio_mask_rolled]  # [audio_len, embed_dim]
 
     # predict first codebook and compute loss
     c0_logits = self.codebook0_head(audio_h)  # [audio_len, audio_vocab_size]
     c0_target = target_tokens[:, 0]  # [audio_len]
-    c0_loss = F.cross_entropy(c0_logits, c0_target)
+    if audio_loss_mask is not None:
+        # weights aligned with target (pre-roll)
+        weights0 = audio_loss_mask[audio_mask].float()
+        c0_per = F.cross_entropy(c0_logits, c0_target, reduction='none')
+        denom0 = torch.clamp(weights0.sum(), min=1.0)
+        c0_loss = (c0_per * weights0).sum() / denom0
+    else:
+        c0_loss = F.cross_entropy(c0_logits, c0_target)
 
     # "compute amortization" (train decoder on random 1/16 subset of audio tokens)
     indices = torch.randperm(c_embeds.size(0))[: c_embeds.size(0) // 16]
@@ -129,7 +138,16 @@ def forward(self, tokens: torch.Tensor, tokens_mask: torch.Tensor):
     decoder_h = self.decoder(self.projection(decoder_embeds), input_pos=c_pos, mask=decoder_causal_mask).to(dtype=dtype)
     c_logits = torch.einsum("bsd,sdv->bsv", decoder_h[:, 1:, :], self.audio_head)
 
-    c_loss = F.cross_entropy(c_logits.reshape(-1, c_logits.size(-1)), target_tokens.reshape(-1))
+    if audio_loss_mask is not None:
+        # weights per selected frame
+        weights1 = audio_loss_mask[audio_mask][indices].float()  # [N]
+        per_elem = F.cross_entropy(c_logits.reshape(-1, c_logits.size(-1)), target_tokens.reshape(-1), reduction='none')
+        per_elem = per_elem.view(c_logits.size(0), c_logits.size(1))  # [N, n_codebooks-1]
+        per_row = per_elem.mean(dim=1)  # average over codebooks for each frame
+        denom1 = torch.clamp(weights1.sum(), min=1.0)
+        c_loss = (per_row * weights1).sum() / denom1
+    else:
+        c_loss = F.cross_entropy(c_logits.reshape(-1, c_logits.size(-1)), target_tokens.reshape(-1))
 
     loss = 2 * ((1 - self.decoder_loss_weight) * c0_loss + self.decoder_loss_weight * c_loss)
     return loss
@@ -224,9 +242,38 @@ def custom_generator_init(self, model: Model, audio_tokenizer: torch.nn.Module, 
     self._watermarker = watermarker
 
 
+def _load_slice_to_24k_device(path: str, start_s=None, end_s=None):
+    info = torchaudio.info(path)
+    sr = info.sample_rate
+    has_start = start_s is not None
+    has_end = end_s is not None
+    if has_start or has_end:
+        s0 = float(start_s) if has_start else 0.0
+        frame_offset = int(max(0.0, s0) * sr)
+        if has_end:
+            span_s = max(0.0, float(end_s) - s0)
+            num_frames = int(span_s * sr) if span_s > 0 else -1
+        else:
+            num_frames = -1
+    else:
+        frame_offset = 0
+        num_frames = -1
+
+    wav, sr_loaded = torchaudio.load(path, frame_offset=frame_offset, num_frames=num_frames)
+    if wav.dim() == 2 and wav.shape[0] > 1:
+        wav = wav.mean(dim=0, keepdim=True)
+    if wav.dim() == 1:
+        wav = wav.unsqueeze(0)
+    wav = torchaudio.functional.resample(wav, orig_freq=sr_loaded, new_freq=MIMI_SAMPLE_RATE)
+    return wav.squeeze(0)
+
+
 def generate_audio(model, audio_tokenizer, text_tokenizer, watermarker, text, speaker_id, device,
-                   use_amp=True, max_audio_length_ms=10_000):
-    """Generate audio from text."""
+                   use_amp=True, max_audio_length_ms=10_000, ref_context=None):
+    """Generate audio from text. Optionally provide reference audio samples for zero-shot voice cloning.
+
+    ref_context: list of dicts like {"path": "/path.wav", "text": "optional", "start": 0.0, "end": 2.0}
+    """
     model.eval()
 
     # keep your custom generator init
@@ -238,11 +285,27 @@ def generate_audio(model, audio_tokenizer, text_tokenizer, watermarker, text, sp
     amp_enabled = bool(use_amp and devtype == "cuda")
     amp_ctx = torch.amp.autocast(device_type="cuda") if amp_enabled else contextlib.nullcontext()
 
+    # build context if provided
+    context_items = []
+    if ref_context:
+        for r in ref_context:
+            if not isinstance(r, dict) or "path" not in r:
+                continue
+            r_text = r.get("text", "") or ""
+            r_start = r.get("start", None)
+            r_end = r.get("end", None)
+            try:
+                wav = _load_slice_to_24k_device(r["path"], r_start, r_end)
+                # generator expects raw audio numpy arrays for context
+                context_items.append({"text": r_text, "audio": wav.squeeze().detach().cpu().numpy()})
+            except Exception:
+                continue
+
     with torch.no_grad(), amp_ctx:
         audio = generator.generate(
             text=text,
             speaker=speaker_id,
-            context=[],
+            context=context_items,
             max_audio_length_ms=max_audio_length_ms,
         )
         audio = audio.squeeze().detach().cpu().numpy()
@@ -256,10 +319,16 @@ def validate(model, valloader, device, use_amp=True):
     model.eval()
     val_losses = []
     with torch.no_grad(), torch.amp.autocast(device_type=str(device), enabled=use_amp):
-        for val_tokens, val_tokens_mask in valloader:
+        for batch in valloader:
+            if len(batch) == 3:
+                val_tokens, val_tokens_mask, val_audio_loss_mask = batch
+                val_audio_loss_mask = val_audio_loss_mask.to(device)
+            else:
+                val_tokens, val_tokens_mask = batch
+                val_audio_loss_mask = None
             val_tokens = val_tokens.to(device)
             val_tokens_mask = val_tokens_mask.to(device)
-            val_loss = model(val_tokens, val_tokens_mask).item()
+            val_loss = model(val_tokens, val_tokens_mask, val_audio_loss_mask).item()
             val_losses.append(val_loss)
     
     avg_val_loss = sum(val_losses) / len(val_losses)

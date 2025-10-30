@@ -68,6 +68,13 @@ Prepare your dataset with train set and validation set metadata files with each 
     "end": 182.6,
     "speaker": 30,
   },
+  {
+  "text": "...", "path": "...", "start": 1.23, "end": 4.56, "speaker": 0,
+  "refs": [
+    {"path": "ref1.wav", "text": "optional transcript", "start": 0.0, "end": 2.0},
+    {"path": "ref2.wav", "text": "..."}
+  ]
+  }
 ```
 
 Since we will want to train for several epochs, it is more efficient to pre-tokenize all the data before starting the training run:

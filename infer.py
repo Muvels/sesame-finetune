@@ -22,7 +22,7 @@ def pick_device():
     return torch.device("cpu")
 
 def load_checkpoint(ckpt_path, device):
-    state = torch.load(ckpt_path, map_location=device)
+    state = torch.load(ckpt_path, map_location=device, weights_only=False)
     # Saved during training: {"model": state_dict, "config": ..., ...}
     if "model" in state:
         sd = state["model"]
