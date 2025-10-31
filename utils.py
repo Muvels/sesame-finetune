@@ -21,7 +21,7 @@ CSM_REPO_PATH = os.getenv("CSM_REPO_PATH")
 WANDB_API_KEY = os.getenv("WANDB_API_KEY")
 if CSM_REPO_PATH:
     sys.path.append(CSM_REPO_PATH)
-    from generator import Generator, load_llama3_tokenizer, load_watermarker
+    from generator import Generator, load_llama3_tokenizer, load_watermarker, Segment
     from models import Model, ModelArgs, _create_causal_mask
 else:
     raise ValueError("CSM_REPO_PATH not set in .env file")
@@ -295,9 +295,9 @@ def generate_audio(model, audio_tokenizer, text_tokenizer, watermarker, text, sp
             r_start = r.get("start", None)
             r_end = r.get("end", None)
             try:
-                wav = _load_slice_to_24k_device(r["path"], r_start, r_end)
-                # generator expects raw audio numpy arrays for context
-                context_items.append({"text": r_text, "audio": wav.squeeze().detach().cpu().numpy()})
+                wav = _load_slice_to_24k_device(r["path"], r_start, r_end)  # 1D torch tensor at 24k
+                # Build Segment dataclass expected by generator
+                context_items.append(Segment(speaker=int(speaker_id), text=r_text, audio=wav))
             except Exception:
                 continue
 
