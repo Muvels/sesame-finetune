@@ -10,6 +10,7 @@ import h5py
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env")
 AUDIO_NUM_CODEBOOKS = int(os.getenv("AUDIO_NUM_CODEBOOKS"))
+MAX_SEQ_LEN = int(os.getenv("MAX_SEQ_LEN", 2048))
 
 
 class TokenizedDataset(Dataset):
@@ -90,6 +91,10 @@ def collate_fn(batch: List[dict]):
         seq_tokens = torch.cat([text_frame, audio_frame], dim=0)
         seq_mask = torch.cat([text_frame_mask, audio_frame_mask], dim=0)
 
+        # Truncate if exceeding model's max seq length
+        if seq_tokens.size(0) > MAX_SEQ_LEN:
+            seq_tokens = seq_tokens[:MAX_SEQ_LEN]
+            seq_mask = seq_mask[:MAX_SEQ_LEN]
         tokens.append(seq_tokens)
         tokens_mask.append(seq_mask)
 
@@ -105,6 +110,9 @@ def collate_fn(batch: List[dict]):
             flm = torch.cat([flm, torch.zeros(1, dtype=torch.long)], dim=0)
             seq_audio_loss_mask = torch.cat([torch.zeros(len(text_tokens), dtype=torch.long), flm], dim=0)
 
+        # Truncate audio loss mask too
+        if seq_audio_loss_mask.size(0) > MAX_SEQ_LEN:
+            seq_audio_loss_mask = seq_audio_loss_mask[:MAX_SEQ_LEN]
         audio_loss_masks.append(seq_audio_loss_mask)
 
     tokens = pad_sequence(tokens, batch_first=True)
