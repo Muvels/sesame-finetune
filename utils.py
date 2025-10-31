@@ -89,6 +89,9 @@ def forward(self, tokens: torch.Tensor, tokens_mask: torch.Tensor, audio_loss_ma
 
     # get targets and codebook embeddings corresponding to audio tokens
     audio_mask = tokens_mask[:, :, 0]  # [bsz, seq_len]
+    # If truncation removed all audio frames, short-circuit with zero loss
+    if audio_mask.sum() == 0:
+        return next(self.parameters()).new_tensor(0.0)
     target_tokens = tokens[audio_mask][:, :-1]  # [audio_len, n_codebooks]
     c_embeds = embeds[:, :, :-1, :][audio_mask]  # [audio_len, n_codebooks, embed_dim] 
 
@@ -122,10 +125,16 @@ def forward(self, tokens: torch.Tensor, tokens_mask: torch.Tensor, audio_loss_ma
         c0_loss = F.cross_entropy(c0_logits, c0_target)
 
     # "compute amortization" (train decoder on random 1/16 subset of audio tokens)
-    indices = torch.randperm(c_embeds.size(0))[: c_embeds.size(0) // 16]
-    c_embeds = c_embeds[indices][:, :-1, :]  # [audio_len//16, n_codebooks-1, embed_dim]
-    audio_h = audio_h[indices]  # [audio_len//16, embed_dim]
-    target_tokens = target_tokens[indices][:, 1:]  # [audio_len//16, n_codebooks-1]
+    # Select subset for decoder training; handle tiny sequences gracefully
+    num_frames = c_embeds.size(0)
+    if num_frames > 0:
+        sel = max(1, num_frames // 16)
+        indices = torch.randperm(num_frames, device=audio_h.device)[: sel]
+        c_embeds = c_embeds[indices][:, :-1, :]  # [N, n_codebooks-1, embed_dim]
+        audio_h = audio_h[indices]  # [N, embed_dim]
+        target_tokens = target_tokens[indices][:, 1:]  # [N, n_codebooks-1]
+    else:
+        indices = None
 
     # concatenate backbone embeddings and codebook embeddings for decoder input
     decoder_embeds = torch.cat(
@@ -138,16 +147,19 @@ def forward(self, tokens: torch.Tensor, tokens_mask: torch.Tensor, audio_loss_ma
     decoder_h = self.decoder(self.projection(decoder_embeds), input_pos=c_pos, mask=decoder_causal_mask).to(dtype=dtype)
     c_logits = torch.einsum("bsd,sdv->bsv", decoder_h[:, 1:, :], self.audio_head)
 
-    if audio_loss_mask is not None:
-        # weights per selected frame
-        weights1 = audio_loss_mask[audio_mask][indices].float()  # [N]
-        per_elem = F.cross_entropy(c_logits.reshape(-1, c_logits.size(-1)), target_tokens.reshape(-1), reduction='none')
-        per_elem = per_elem.view(c_logits.size(0), c_logits.size(1))  # [N, n_codebooks-1]
-        per_row = per_elem.mean(dim=1)  # average over codebooks for each frame
-        denom1 = torch.clamp(weights1.sum(), min=1.0)
-        c_loss = (per_row * weights1).sum() / denom1
+    if indices is None:
+        c_loss = c0_logits.new_tensor(0.0)
     else:
-        c_loss = F.cross_entropy(c_logits.reshape(-1, c_logits.size(-1)), target_tokens.reshape(-1))
+        if audio_loss_mask is not None:
+            # weights per selected frame
+            weights1 = audio_loss_mask[audio_mask][indices].float()  # [N]
+            per_elem = F.cross_entropy(c_logits.reshape(-1, c_logits.size(-1)), target_tokens.reshape(-1), reduction='none')
+            per_elem = per_elem.view(c_logits.size(0), c_logits.size(1))  # [N, n_codebooks-1]
+            per_row = per_elem.mean(dim=1)  # average over codebooks for each frame
+            denom1 = torch.clamp(weights1.sum(), min=1.0)
+            c_loss = (per_row * weights1).sum() / denom1
+        else:
+            c_loss = F.cross_entropy(c_logits.reshape(-1, c_logits.size(-1)), target_tokens.reshape(-1))
 
     loss = 2 * ((1 - self.decoder_loss_weight) * c0_loss + self.decoder_loss_weight * c_loss)
     return loss
