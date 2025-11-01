@@ -48,7 +48,7 @@ def parse_args(arg_string=None):
         "--gen_sentences",
         type=str,
         default="Bird law in this country is not governed by reason.",
-        help="Sentence(s) for model to generate. If a path is provided, the model will generate from the sentences in the file.",
+        help="Sentence(s) for periodic generation. Accepts a string, a .txt file (one sentence per line), or a .csv with columns: sentences_to_generate,use_ref,path_to_ref,_transcript_of_ref",
     )
     parser.add_argument("--gen_speaker", type=int, default=999, help="Speaker id for model to generate")
     parser.add_argument(
@@ -63,7 +63,7 @@ def parse_args(arg_string=None):
     args = parser.parse_args(arg_string.split() if arg_string else None)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    args.gen_sentences = Path(args.gen_sentences) if args.gen_sentences.endswith(".txt") else args.gen_sentences
+    args.gen_sentences = Path(args.gen_sentences) if args.gen_sentences.endswith((".txt", ".csv")) else args.gen_sentences
 
     if args.train_from_scratch:
         args.model_name_or_checkpoint_path = None
@@ -206,24 +206,51 @@ def train(args: argparse.Namespace, config: dict, device: torch.device, trial: o
             
             if args.gen_every and step % args.gen_every == 0 and not (args.train_from_scratch and step == 0):
 
-                gen_sentences = []
+                # Build a list of {text, ref_context} to generate
+                to_generate = []
                 if isinstance(args.gen_sentences, str):
-                    gen_sentences.append(args.gen_sentences)
+                    to_generate.append({"text": args.gen_sentences, "ref_context": gen_ref_context})
                 elif isinstance(args.gen_sentences, Path):
-                    with open(args.gen_sentences, "r") as f:
-                        gen_sentences = f.readlines()
+                    if args.gen_sentences.suffix == ".txt":
+                        with open(args.gen_sentences, "r") as f:
+                            lines = [ln.strip() for ln in f.readlines() if ln.strip()]
+                        for ln in lines:
+                            to_generate.append({"text": ln, "ref_context": gen_ref_context})
+                    elif args.gen_sentences.suffix == ".csv":
+                        import csv
+                        with open(args.gen_sentences, newline="") as f:
+                            reader = csv.DictReader(f)
+                            for row in reader:
+                                text = (row.get("sentences_to_generate") or "").strip()
+                                if not text:
+                                    continue
+                                # per-row ref context if requested, else fall back to global gen_ref_context
+                                use_ref_str = (row.get("use_ref") or "").strip().lower()
+                                use_ref = use_ref_str in ("1", "true", "yes", "y", "t")
+                                ref_ctx = None
+                                if use_ref:
+                                    p = (row.get("path_to_ref") or "").strip()
+                                    if p:
+                                        ref_item = {"path": p}
+                                        t = (row.get("_transcript_of_ref") or "").strip()
+                                        if t:
+                                            ref_item["text"] = t
+                                        ref_ctx = [ref_item]
+                                if ref_ctx is None:
+                                    ref_ctx = gen_ref_context
+                                to_generate.append({"text": text, "ref_context": ref_ctx})
 
-                for i, sentence in enumerate(gen_sentences):
+                for i, item in enumerate(to_generate):
                     audio = generate_audio(
                         model,
                         audio_tokenizer,
                         text_tokenizer,
                         watermarker,
-                        sentence,
+                        item["text"],
                         args.gen_speaker,
                         device,
                         use_amp=args.use_amp,
-                        ref_context=gen_ref_context
+                        ref_context=item["ref_context"],
                     )
                     
                     wandb.log({f"audio_{i}": wandb.Audio(audio, sample_rate=MIMI_SAMPLE_RATE)}, step=step)

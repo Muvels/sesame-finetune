@@ -66,33 +66,63 @@ def trim_leading_silence(y: np.ndarray, sr: int, top_db: float = 40.0, prepad_ms
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--checkpoint", type=Path, required=True,
-                   help="Path to model_*.pt (e.g., exp/model_bestval.pt)")
+    p.add_argument("--checkpoint", type=Path, default=None,
+                   help="Optional path to local checkpoint model_*.pt. If omitted, loads default 'sesame/csm-1b'.")
     p.add_argument("--text", type=str, nargs="+", required=True,
                    help='One or more prompts, e.g. --text "Hallo Welt" "Wie geht es dir?"')
     p.add_argument("--speaker", type=int, default=999, help="Speaker ID to use")
     p.add_argument("--out_dir", type=Path, default=Path("tts_out"))
     p.add_argument("--trim_silence", action="store_true",
                    help="Trim leading silence so output starts right away")
+    # Reference audio (optional, repeatable for multiple refs)
+    p.add_argument("--ref", type=Path, action="append", default=None,
+                   help="Path to reference audio (wav/mp3). Repeat to add multiple references.")
+    p.add_argument("--ref_text", type=str, action="append", default=None,
+                   help="Optional transcript text for each --ref (use same order; repeatable).")
+    p.add_argument("--ref_start", type=float, action="append", default=None,
+                   help="Optional start time in seconds for each --ref (use same order; repeatable).")
+    p.add_argument("--ref_end", type=float, action="append", default=None,
+                   help="Optional end time in seconds for each --ref (use same order; repeatable).")
     args = p.parse_args()
 
     device = pick_device()
     print(f"[info] device: {device}")
 
     # 1) Rebuild model & load weights
-    state_dict, cfg = load_checkpoint(args.checkpoint, device)
-    dec_w = cfg.get("decoder_loss_weight", 1.0)
-    model = load_model(model_name_or_checkpoint_path=None,
-                       device=device,
-                       decoder_loss_weight=dec_w)
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    if missing or unexpected:
-        print(f"[warn] missing keys: {len(missing)}, unexpected keys: {len(unexpected)}")
+    if args.checkpoint is not None:
+        state_dict, cfg = load_checkpoint(args.checkpoint, device)
+        dec_w = cfg.get("decoder_loss_weight", 1.0)
+        model = load_model(model_name_or_checkpoint_path=None,
+                           device=device,
+                           decoder_loss_weight=dec_w)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing or unexpected:
+            print(f"[warn] missing keys: {len(missing)}, unexpected keys: {len(unexpected)}")
+    else:
+        print("[info] no --checkpoint provided; loading default Hugging Face model 'sesame/csm-1b'")
+        # decoder_loss_weight only affects training/loss; 0.5 is the default in configs
+        model = load_model(model_name_or_checkpoint_path="sesame/csm-1b",
+                           device=device,
+                           decoder_loss_weight=0.5)
     model.eval()
 
     # 2) Tokenizers + (optional) watermarker used by generate_audio
     text_tok, audio_tok = load_tokenizers(device)
     wm = load_watermarker(device=device)
+
+    # Build reference context if provided
+    ref_context = None
+    if args.ref:
+        ref_context = []
+        for i_ref, ref_path in enumerate(args.ref):
+            item = {"path": str(ref_path)}
+            if args.ref_text and i_ref < len(args.ref_text):
+                item["text"] = args.ref_text[i_ref]
+            if args.ref_start and i_ref < len(args.ref_start):
+                item["start"] = args.ref_start[i_ref]
+            if args.ref_end and i_ref < len(args.ref_end):
+                item["end"] = args.ref_end[i_ref]
+            ref_context.append(item)
 
     # 3) Generate for each prompt
     for i, sentence in enumerate(args.text):
@@ -106,6 +136,7 @@ def main():
                 args.speaker,      # speaker id
                 device,
                 use_amp=False,
+                ref_context=ref_context,
             )
 
         audio = np.asarray(audio, dtype=np.float32)

@@ -1,0 +1,5 @@
+sentences_to_generate,use_ref,path_to_ref,_transcript_of_ref
+Ja der Termin ist noch frei,true,ref_csm.wav,"Ich bekomme zweihundert Dollar die Stunde, sie"
+Dafür müssten sie mir einmal ihren Vornamen, Nachnamen, und ihr Geburtsdatum nennen,false,,
+Guten Tag, Ich bin ihre Virtuelle Assistenz. Wie kann ich ihnen heute helfen?,true,voice.wav,"Ich bekomme zweihundert Dollar die Stunde, sie"
+Hello there how are you today,true,voice.wav,"Hi there. Since I've joined the cast of The Good Doctor, I've learned much more about the history of autism than I never knew about before, how perceptions and diagnoses have changed over time."
