@@ -124,11 +124,12 @@ def forward(self, tokens: torch.Tensor, tokens_mask: torch.Tensor, audio_loss_ma
     else:
         c0_loss = F.cross_entropy(c0_logits, c0_target)
 
-    # "compute amortization" (train decoder on random 1/16 subset of audio tokens)
+    # "compute amortization" (train decoder on random subset of audio tokens)
     # Select subset for decoder training; handle tiny sequences gracefully
     num_frames = c_embeds.size(0)
     if num_frames > 0:
-        sel = max(1, num_frames // 16)
+        amort_div = getattr(self, "decoder_amortization_divisor", 16)
+        sel = max(1, num_frames // max(1, int(amort_div)))
         indices = torch.randperm(num_frames, device=audio_h.device)[: sel]
         c_embeds = c_embeds[indices][:, :-1, :]  # [N, n_codebooks-1, embed_dim]
         audio_h = audio_h[indices]  # [N, embed_dim]

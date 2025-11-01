@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 from dotenv import load_dotenv
-from typing import List
+from typing import List, Callable
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, Sampler
@@ -59,7 +59,7 @@ class TokenizedDataset(Dataset):
         return {"audio": audio, "text": text, "frame_loss_mask": frame_loss_mask}
 
 
-def collate_fn(batch: List[dict]):
+def _collate_with_eos_weight(batch: List[dict], eos_weight: float):
     """
     Collate function for tokenized audio and text.
     Merges variable-length audio/text into a single padded tensor.
@@ -99,17 +99,19 @@ def collate_fn(batch: List[dict]):
         tokens_mask.append(seq_mask)
 
         # Build per-sequence audio loss mask aligned to seq length
-        # text positions -> 0; audio positions -> provided frame mask; EOS frame -> 1 (teach stop)
+        # text positions -> 0; audio positions -> provided frame mask; EOS frame -> eos_weight
         if frame_loss_mask is not None:
             flm = frame_loss_mask.long().view(-1)
-            # supervise EOS: last appended position corresponds to EOS frame -> weight 1
-            flm = torch.cat([flm, torch.ones(1, dtype=torch.long)], dim=0)
+            # last appended position corresponds to EOS frame -> weight eos_weight
+            eos = torch.full((1,), int(eos_weight != 0), dtype=torch.long)
+            # keep mask binary; weight is applied later by multiplication
+            flm = torch.cat([flm, eos], dim=0)
             seq_audio_loss_mask = torch.cat([torch.zeros(len(text_tokens), dtype=torch.long), flm], dim=0)
         else:
-            # default: include all audio frames including EOS in loss
+            # default: include all audio frames in loss; EOS flagged (1) and scaled later
             flm = torch.ones(audio_tokens.size(1) - 1, dtype=torch.long)
-            # append 1 for EOS supervision
-            flm = torch.cat([flm, torch.ones(1, dtype=torch.long)], dim=0)
+            eos = torch.full((1,), int(eos_weight != 0), dtype=torch.long)
+            flm = torch.cat([flm, eos], dim=0)
             seq_audio_loss_mask = torch.cat([torch.zeros(len(text_tokens), dtype=torch.long), flm], dim=0)
 
         # Truncate audio loss mask too
@@ -121,7 +123,22 @@ def collate_fn(batch: List[dict]):
     tokens_mask = pad_sequence(tokens_mask, batch_first=True, padding_value=False)
     audio_loss_masks = pad_sequence(audio_loss_masks, batch_first=True, padding_value=0)
 
+    # Apply eos_weight (float) to EOS position(s): multiply last audio position where mask==1 by eos_weight
+    # We detect EOS as the last position in each sequence where audio frame was appended; since sequences are padded,
+    # we scale the entire sequence by 1.0 first, then directly scale the final position to eos_weight when mask==1.
+    # Implement by converting to float and multiplying elementwise by a vector with last element = eos_weight.
+    audio_loss_masks = audio_loss_masks.float()
+    # Build a per-sequence vector with last position = eos_weight if that position is 1; otherwise remains 0.
+    for i in range(audio_loss_masks.size(0)):
+        if audio_loss_masks[i, -1] != 0:
+            audio_loss_masks[i, -1] = eos_weight
     return tokens, tokens_mask, audio_loss_masks
+
+
+def make_collate_fn(eos_weight: float = 1.0) -> Callable[[List[dict]], tuple]:
+    def _fn(batch: List[dict]):
+        return _collate_with_eos_weight(batch, eos_weight)
+    return _fn
 
 
 class BucketSampler(Sampler):
@@ -187,6 +204,7 @@ def create_dataloaders(
     infinite_train: bool = False,
     load_in_memory: bool = False,
     num_workers: int = 0,
+    eos_loss_weight: float = 1.0,
 ):
     """
     Creates training and validation dataloaders from an HDF5 file.
@@ -210,12 +228,12 @@ def create_dataloaders(
 
     trainloader = DataLoader(
         trainset, batch_sampler=trainsampler,
-        collate_fn=collate_fn, num_workers=num_workers, pin_memory=True
+        collate_fn=make_collate_fn(eos_loss_weight), num_workers=num_workers, pin_memory=True
     )
 
     valloader = DataLoader(
         valset, batch_sampler=valsampler,
-        collate_fn=collate_fn, num_workers=num_workers, pin_memory=True
+        collate_fn=make_collate_fn(eos_loss_weight), num_workers=num_workers, pin_memory=True
     )
 
     return trainloader, valloader

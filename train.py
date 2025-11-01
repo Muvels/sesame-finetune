@@ -59,6 +59,8 @@ def parse_args(arg_string=None):
 
     parser.add_argument("--use_amp", action="store_true", help="Use Automatic Mixed Precision")
     parser.add_argument("--n_epochs", type=int, default=50, help="Number of epochs to train. If not provided, the training will run indefinitely.")
+    parser.add_argument("--eos_loss_weight", type=float, default=0.2, help="Loss weight applied to EOS audio frame (0 disables EOS supervision)")
+    parser.add_argument("--decoder_amortization_divisor", type=int, default=8, help="Train decoder on ~1/divisor of audio frames (lower = more frames)")
 
     args = parser.parse_args(arg_string.split() if arg_string else None)
 
@@ -81,13 +83,16 @@ def train(args: argparse.Namespace, config: dict, device: torch.device, trial: o
     
     # Load / create: model, tokenizers, dataloaders, optimizer, scheduler, and grad scaler.
     model = load_model(model_name_or_checkpoint_path=args.model_name_or_checkpoint_path, device=device, decoder_loss_weight=config["decoder_loss_weight"])
+    # Configure decoder amortization divisor on the model for forward()
+    setattr(model, "decoder_amortization_divisor", max(1, int(args.decoder_amortization_divisor)))
     text_tokenizer, audio_tokenizer = load_tokenizers(device)
     watermarker = load_watermarker(device=device)
     trainloader, valloader = create_dataloaders(
         args.data, 
         config["batch_size"], 
         infinite_train=False,
-        load_in_memory=not args.partial_data_loading
+        load_in_memory=not args.partial_data_loading,
+        eos_loss_weight=float(args.eos_loss_weight),
     )
     total_steps = args.n_epochs * len(trainloader) if args.n_epochs else None
     optimizer = torch.optim.AdamW(
