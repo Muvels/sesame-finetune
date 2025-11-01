@@ -99,15 +99,17 @@ def collate_fn(batch: List[dict]):
         tokens_mask.append(seq_mask)
 
         # Build per-sequence audio loss mask aligned to seq length
-        # text positions -> 0; audio positions -> provided frame mask; EOS frame -> 0
+        # text positions -> 0; audio positions -> provided frame mask; EOS frame -> 1 (teach stop)
         if frame_loss_mask is not None:
             flm = frame_loss_mask.long().view(-1)
-            flm = torch.cat([flm, torch.zeros(1, dtype=torch.long)], dim=0)  # pad for EOS
+            # supervise EOS: last appended position corresponds to EOS frame -> weight 1
+            flm = torch.cat([flm, torch.ones(1, dtype=torch.long)], dim=0)
             seq_audio_loss_mask = torch.cat([torch.zeros(len(text_tokens), dtype=torch.long), flm], dim=0)
         else:
-            # default: include all audio frames (except EOS) in loss
+            # default: include all audio frames including EOS in loss
             flm = torch.ones(audio_tokens.size(1) - 1, dtype=torch.long)
-            flm = torch.cat([flm, torch.zeros(1, dtype=torch.long)], dim=0)
+            # append 1 for EOS supervision
+            flm = torch.cat([flm, torch.ones(1, dtype=torch.long)], dim=0)
             seq_audio_loss_mask = torch.cat([torch.zeros(len(text_tokens), dtype=torch.long), flm], dim=0)
 
         # Truncate audio loss mask too
